@@ -15,7 +15,8 @@ class Settings(BaseSettings):
     storage_dir: Path = Path("./data")
 
     # ── Pipeline mode ─────────────────────────────────────────────────────
-    pipeline_mode: str = "mock"
+    pipeline_mode: str = "real"
+
 
     # ── Hugging Face & Vision LLM Keys ───────────────────────────────────
     huggingface_token: str = ""

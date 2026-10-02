@@ -1,11 +1,16 @@
 """
-Multimodal Vision LLM Spatial Layout & Door-First Relative Anchor Engine.
+Vision LLM Room Analyzer with Attribute, Material & Wall Decor Detection.
 
-Uses a multi-photo landmark and wall-anchored reasoning flow:
-  Step 1: Identify & anchor the entrance door wall and metric position.
-  Step 2: Cross-reference architectural landmarks (windows, door, corners).
-  Step 3: Calculate metric [X, 0.0, Z] coordinates and rotation angles.
-Includes explicit logging and a geometric door-anchored 2D-to-3D projection fallback.
+Sends uploaded room photo(s) to Gemini Vision and asks for:
+  1. A list of detected items (floor furniture + wall-mounted decor) with:
+     - label (canonical category)
+     - placement ("floor" or "wall")
+     - material ("wood", "fabric", "leather", "metal", "glass", "greenery")
+     - color_hex (sampled 6-digit hex color)
+     - wall_attachment ("back", "left", "right", "front" if wall-mounted)
+     - height_m (mounting height in meters if wall-mounted)
+  2. The dominant wall paint hex color.
+  3. The dominant floor surface hex color.
 """
 from __future__ import annotations
 
@@ -14,8 +19,9 @@ import io
 import json
 import logging
 import os
+import re
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 import httpx
 from PIL import Image
@@ -26,460 +32,348 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 
-# ─── Pydantic Output Schemas ──────────────────────────────────────────────────
+# ─── Output Schema ────────────────────────────────────────────────────────────
 
-class DoorPrediction(BaseModel):
-    wall: Literal["front", "back", "left", "right"] = Field(
-        "front",
-        description="Wall where door is located: 'front', 'back', 'left', or 'right'",
-    )
-    offset_m: float = Field(
-        0.0,
-        description="Metric offset along the wall relative to wall center (meters)",
-    )
-    width_m: float = Field(0.9, description="Standard door width in meters")
-    height_m: float = Field(2.1, description="Standard door height in meters")
+class SemanticFurnitureItem(BaseModel):
+    """A detected furniture or wall item with semantic topological layout properties."""
+    id: str = Field(..., description="Unique item identifier, e.g. 'bed_1', 'nightstand_left'")
+    label: str = Field(..., description="Canonical item name, e.g. 'bed', 'sofa', 'wall tv'")
+    sub_variant: Optional[str] = Field(None, description="Catalog template ID, e.g. 'bed_modern_double'")
+    dominant_color_hex: Optional[str] = Field(None, description="Sampled 6-digit hex color, e.g. '#8B5A2B'")
+    material: Optional[str] = Field(None, description="wood | fabric | leather | metal | glass | greenery")
+    wall_anchor: str = Field("back", description="Anchored wall: back | left | right | front | center")
+    relative_position: str = Field("center", description="Topological position: center | left_of:<id> | right_of:<id> | opposite:<id> | standalone")
+    placement_type: str = Field("floor", description="'floor' for floor items, 'wall' for wall-mounted items")
+    height_m: Optional[float] = Field(None, description="Mounting height in metres for wall items (typically 1.4-1.8)")
+
+    # Backwards-compatibility properties
+    @property
+    def color_hex(self) -> Optional[str]:
+        return self.dominant_color_hex
+
+    @property
+    def placement(self) -> str:
+        return self.placement_type
+
+    @property
+    def wall_attachment(self) -> Optional[str]:
+        return self.wall_anchor if self.placement_type == "wall" else None
 
 
-class FurniturePrediction(BaseModel):
-    id: str = Field(..., description="Unique identifier for the item")
-    label: str = Field(..., description="Canonical category (sofa, bed, table, etc.)")
-    matched_photo_index: int = Field(0, description="0-indexed photo where item is clearest")
-    position: list[float] = Field(
-        ...,
-        min_length=2,
-        max_length=3,
-        description="Estimated [X, 0.0, Z] metric coordinates where [0, 0] is room center",
-    )
-    rotation_y_deg: float = Field(0.0, description="Y-axis rotation angle in degrees")
-    wall_alignment: Optional[str] = Field(
+# Backwards compatibility alias
+DetectedItem = SemanticFurnitureItem
+
+
+class RoomDetectionResult(BaseModel):
+    """Full semantic detection and topological layout result from Gemini Vision."""
+    room_type: str = Field("bedroom", description="bedroom | living_room | office | dining_room | other")
+    wall_color_hex: Optional[str] = Field(
         None,
-        description="Wall alignment: 'back', 'front', 'left', 'right', or 'center'",
+        description="Dominant wall paint color as 6-digit hex, e.g. '#E8E3DC'."
     )
-
-
-class SpatialLayoutPlan(BaseModel):
-    door: Optional[DoorPrediction] = None
-    furniture: list[FurniturePrediction] = Field(
+    floor_color_hex: Optional[str] = Field(
+        None,
+        description="Dominant floor surface color as 6-digit hex, e.g. '#8B5A2B'."
+    )
+    floor_material: Optional[str] = Field("hardwood", description="hardwood | tile | carpet | concrete")
+    hero_item_id: Optional[str] = Field(None, description="Primary focal item ID, e.g. 'bed_1', 'sofa_1', 'desk_1'")
+    furniture: list[SemanticFurnitureItem] = Field(
         default_factory=list,
-        description="List of placed unique furniture items",
+        description="All detected furniture and wall decor items."
     )
 
-
-# ─── Multi-Photo Landmark & Wall-Anchored System Prompt ───────────────────────
-
-def _build_prompt(
-    num_photos: int,
-    room_width_m: float,
-    room_length_m: float,
-    room_height_m: float,
-    detected_items: list[Any] | None,
-) -> str:
-    """
-    Builds a rich, grounded system prompt that:
-    - Defines the coordinate frame explicitly.
-    - Embeds the exact list of detected item IDs + labels so Gemini performs
-      strict 1:1 ID assignment without inventing extra furniture.
-    - Instructs Gemini to clamp coordinates within room bounds (0.3m margin).
-    """
-    w_half = room_width_m / 2.0
-    l_half = room_length_m / 2.0
-    margin = 0.3
-
-    # Build the detected item manifest the LLM must assign coordinates to
-    item_lines = []
-    furniture_items = [
-        it for it in (detected_items or [])
-        if getattr(it, "label", "").lower() not in ["door", "doorway", "entrance"]
-    ]
-    n_items = len(furniture_items)
-
-    for it in furniture_items:
-        item_id = getattr(it, "item_id", getattr(it, "id", "unknown"))
-        label = getattr(it, "label", "furniture")
-        conf = getattr(it, "confidence", 0.5)
-        bbox = getattr(it, "bbox", [0.25, 0.25, 0.75, 0.75])
-        item_lines.append(
-            f'  {{"id": "{item_id}", "label": "{label}", "confidence": {conf:.2f}, '
-            f'"bbox_center": [{(bbox[0]+bbox[2])/2:.2f}, {(bbox[1]+bbox[3])/2:.2f}]}}'
-        )
-
-    items_json = "[\n" + ",\n".join(item_lines) + "\n]" if item_lines else "[]"
-
-    lines = [
-        "You are an expert 3D interior architect performing multi-photo room reconstruction.",
-        f"Room dimensions: Width (X) = {room_width_m:.2f}m, Length (Z) = {room_length_m:.2f}m, Height (Y) = {room_height_m:.2f}m.",
-        f"Room center is [0, 0, 0]. You have {num_photos} uploaded photo(s) of this room.",
-        "",
-        "=== COORDINATE SYSTEM ===",
-        f"  Back Wall:  Z = -{l_half:.2f}m  (wall opposite the entrance)",
-        f"  Front Wall: Z = +{l_half:.2f}m  (entrance/door wall, camera typically faces this direction)",
-        f"  Left Wall:  X = -{w_half:.2f}m",
-        f"  Right Wall: X = +{w_half:.2f}m",
-        f"  Floor:      Y = 0.0",
-        f"  VALID X range: [{-w_half+margin:.2f}, {w_half-margin:.2f}] (enforced margin {margin}m from walls)",
-        f"  VALID Z range: [{-l_half+margin:.2f}, {l_half-margin:.2f}]",
-        "",
-        f"=== DETECTED FURNITURE ({n_items} unique items — assign ALL, invent NONE) ===",
-        items_json,
-        "",
-        "=== YOUR TASK ===",
-        "1. DOOR: Identify the entrance door in the photos. Report which wall it is on and its metric offset from the wall center.",
-        "2. FURNITURE: For each item in the detected list above, analyze the photos and assign:",
-        "   - id: MUST exactly match the 'id' from the list above.",
-        "   - position: [X, 0.0, Z] in meters, within the valid ranges above.",
-        "   - rotation_y_deg: 0 = facing front (+Z), 90 = facing right (+X), 180 = facing back (-Z), -90 = facing left (-X).",
-        "   - wall_alignment: 'back' | 'front' | 'left' | 'right' | 'center'.",
-        "3. Use the bbox_center field (normalized 0..1 image coords) as spatial hints to anchor positions.",
-        "4. Cross-reference architectural landmarks (windows, corners, door) across photos to triangulate locations.",
-        "",
-        "RULES:",
-        "  - Return EXACTLY the same number of furniture entries as the detected list. No additions, no omissions.",
-        f"  - All X values MUST be in [{-w_half+margin:.2f}, {w_half-margin:.2f}]. All Z values MUST be in [{-l_half+margin:.2f}, {l_half-margin:.2f}].",
-        "  - Y coordinate is ALWAYS 0.0 (floor plane).",
-        "",
-        "Return ONLY valid JSON matching this schema (no markdown, no explanation):",
-        '{{',
-        '  "door": {{"wall": "front", "offset_m": 0.0, "width_m": 0.9, "height_m": 2.1}},',
-        '  "furniture": [',
-        '    {{"id": "<exact_id_from_list>", "label": "<label>", "matched_photo_index": 0, "position": [X, 0.0, Z], "rotation_y_deg": 0, "wall_alignment": "back"}}',
-        '  ]',
-        '}}',
-    ]
-    return "\n".join(lines)
+    @property
+    def items(self) -> list[SemanticFurnitureItem]:
+        """Backwards compatibility alias for furniture items."""
+        return self.furniture
 
 
-# ─── Image Preprocessing & Base64 Encoding ────────────────────────────────────
+# ─── Image Encoding ────────────────────────────────────────────────────────────
 
 def _encode_image_b64(path: Path, max_dim: int = 1024) -> tuple[str, str]:
-    """
-    Resizes uploaded room image to max 1024px to prevent large payload timeouts
-    and returns (base64_data_string, 'image/jpeg').
-    """
+    """Resize and base64-encode an image for Gemini inline payload."""
     try:
         with Image.open(path) as img:
             img = img.convert("RGB")
             w, h = img.size
             if max(w, h) > max_dim:
                 scale = max_dim / float(max(w, h))
-                new_w, new_h = int(w * scale), int(h * scale)
-                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                logger.info("Resized %s from (%d, %d) to (%d, %d) for Vision LLM", path.name, w, h, new_w, new_h)
+                img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=85)
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
             return b64, "image/jpeg"
     except Exception as exc:
-        logger.warning("Failed image resize for %s (%s), reading raw bytes", path, exc)
+        logger.warning("Image encode fallback for %s: %s", path, exc)
         with open(path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-        return b64, "image/jpeg"
+            return base64.b64encode(f.read()).decode("utf-8"), "image/jpeg"
 
 
-# ─── Gemini & OpenAI Vision API Handlers ───────────────────────────────────────
+# ─── Prompt Builder ────────────────────────────────────────────────────────────
 
-def _call_gemini_vision(
-    image_paths: list[Path],
-    prompt: str,
-    api_key: str,
-) -> Optional[dict]:
-    """
-    Calls Google Gemini Generative Language API with inline base64 image parts.
-    Tries candidate models: gemini-2.5-flash, gemini-1.5-flash, gemini-flash-latest, gemini-flash-lite-latest.
-    Logs full HTTP status and payload to console.
-    """
+DETECTION_PROMPT = """You are an expert interior design and spatial planning analyst examining a room photo.
+
+Return a JSON object with EXACTLY this structure — no markdown, no explanation:
+
+{
+  "room_type": "bedroom",
+  "wall_color_hex": "#E8E3DC",
+  "floor_color_hex": "#C8B89A",
+  "floor_material": "hardwood",
+  "hero_item_id": "bed_1",
+  "furniture": [
+    {
+      "id": "bed_1",
+      "label": "bed",
+      "sub_variant": "bed_modern_double",
+      "dominant_color_hex": "#D8CEBE",
+      "material": "fabric",
+      "wall_anchor": "back",
+      "relative_position": "center",
+      "placement_type": "floor",
+      "height_m": null
+    },
+    {
+      "id": "nightstand_left",
+      "label": "nightstand",
+      "sub_variant": "nightstand_modern",
+      "dominant_color_hex": "#C49E6C",
+      "material": "wood",
+      "wall_anchor": "back",
+      "relative_position": "left_of:bed_1",
+      "placement_type": "floor",
+      "height_m": null
+    },
+    {
+      "id": "wall_art_1",
+      "label": "wall art",
+      "sub_variant": "wall_art_canvas",
+      "dominant_color_hex": "#3B2317",
+      "material": "fabric",
+      "wall_anchor": "back",
+      "relative_position": "center",
+      "placement_type": "wall",
+      "height_m": 1.5
+    }
+  ]
+}
+
+Rules:
+1. "room_type": One of "bedroom" | "living_room" | "office" | "dining_room" | "other".
+2. "wall_color_hex": Dominant wall paint color as 6-digit hex code "#RRGGBB" (e.g. "#E8E3DC", "#D4C5B9", "#2C3E50").
+3. "floor_color_hex": Dominant flooring color as 6-digit hex code "#RRGGBB" (e.g. "#8B5A2B", "#C49E6C", "#C8BFB0", "#7E8287").
+4. "floor_material": One of "hardwood" | "tile" | "carpet" | "concrete".
+5. "hero_item_id": The primary focal furniture piece in the room (e.g. "bed_1" in bedroom, "sofa_1" in living room, "desk_1" in office). Must match one ID in "furniture".
+6. "furniture": List visible furniture and wall-mounted decor (max 14 items).
+   - "id": A unique ID for each item, e.g. "bed_1", "nightstand_left", "nightstand_right", "wardrobe_1", "sofa_1", "coffee_table_1", "desk_1", "wall_tv_1", "wall_art_1".
+   - "label": Canonical category name:
+     Floor: bed, sofa, armchair, chair, office chair, desk, coffee table, dining table, wardrobe, bookshelf, nightstand, tv stand, coat rack, floor lamp, table lamp, plant, rug, pouf, mirror, dresser
+     Wall: wall tv, wall art, wall mirror, wall clock
+   - "sub_variant": Specific catalog variant:
+     Beds: bed_modern_double, bed_upholstered_fabric, bed_platform_wood
+     Sofas/Chairs: sofa_three_seater, sofa_leather_dark, sofa_sectional_l, armchair_lounge, chair_dining, chair_office_ergonomic
+     Tables/Desks: desk_wood_minimal, desk_minimal_white, table_coffee_wood, table_coffee_glass, table_dining_round
+     Storage: wardrobe_two_door, bookshelf_tall, nightstand_modern, stand_tv_console, stand_coat_rack
+     Lamps: lamp_floor_arc, lamp_table_modern, lamp_tripod_floor
+     Decor: plant_potted_monstera, plant_snake_tall, mirror_arched_floor, rug_area_large, pouf_boucle_round
+     Wall: wall_tv_flat, wall_art_canvas, wall_mirror_circular, wall_clock_minimal
+   - "dominant_color_hex": Sampled 6-digit hex color for the item.
+   - "material": "wood" | "fabric" | "leather" | "metal" | "glass" | "greenery" | null.
+   - "wall_anchor": Which room wall this item is anchored or nearest to:
+     "back" (the primary wall facing the camera/entrance), "left", "right", "front", or "center" (for floating rugs, coffee tables).
+   - "relative_position":
+     - "center": centered along its wall anchor or in room center.
+     - "left_of:<id>": positioned immediately to the left of target item.
+     - "right_of:<id>": positioned immediately to the right of target item.
+     - "opposite:<id>": positioned against opposing wall facing target item.
+     - "standalone": positioned as a standalone piece along the wall.
+   - "placement_type": "floor" for floor resting items, "wall" for items mounted on walls.
+   - "height_m": ONLY for placement_type=="wall": mounting height in meters (e.g. 1.5). null for floor items.
+7. If no furniture is visible, return furniture: [].
+"""
+
+
+# ─── Gemini Vision Caller ──────────────────────────────────────────────────────
+
+def _call_gemini_vision(image_paths: list[Path], api_key: str) -> Optional[dict]:
+    """Call Gemini Vision API with room photo(s) and structured detection prompt."""
     candidate_models = [
-        "gemini-3.6-flash",
-        "gemini-flash-lite-latest",
-        "gemini-2.5-flash",
-        "gemini-1.5-flash",
-        "gemini-flash-latest",
+        ("v1beta", "gemini-3.1-flash-lite-preview"),
+        ("v1beta", "gemini-3-flash-preview"),
+        ("v1beta", "gemini-3.1-flash-lite"),
+        ("v1beta", "gemini-3.5-flash-lite"),
     ]
 
-    parts: list[dict[str, Any]] = [{"text": prompt}]
-
+    parts: list[dict[str, Any]] = [{"text": DETECTION_PROMPT}]
     for path in image_paths:
         b64_data, mime = _encode_image_b64(path)
-        parts.append({
-            "inline_data": {
-                "mime_type": mime,
-                "data": b64_data,
-            }
-        })
+        parts.append({"inline_data": {"mime_type": mime, "data": b64_data}})
 
     payload = {
         "contents": [{"parts": parts}],
         "generationConfig": {
-            "response_mime_type": "application/json",
             "temperature": 0.1,
+            "maxOutputTokens": 1024,
         },
     }
 
     logger.info("[SPATIAL_PLANNER] Initiating Gemini Vision API call with %d photo(s)...", len(image_paths))
 
-    with httpx.Client(timeout=35.0) as client:
-        for model in candidate_models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    with httpx.Client(timeout=30.0) as client:
+        for ver, model in candidate_models:
+            url = f"https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent?key={api_key}"
             try:
-                logger.info("[SPATIAL_PLANNER] Requesting model '%s'...", model)
+                logger.info("[SPATIAL_PLANNER] Trying model: %s/%s", ver, model)
                 resp = client.post(url, json=payload)
                 if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates", [])
                     if candidates and "content" in candidates[0]:
-                        raw_text = candidates[0]["content"]["parts"][0]["text"]
-                        parsed_json = json.loads(raw_text)
-                        logger.info("[SUCCESS] Gemini Vision spatial layout returned clean coordinates (model: %s).", model)
-                        logger.info("[SPATIAL_PLANNER] Parsed payload:\n%s", json.dumps(parsed_json, indent=2))
-                        return parsed_json
+                        raw_text = candidates[0]["content"]["parts"][0]["text"].strip()
+                        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+                        raw_text = re.sub(r"\s*```$", "", raw_text)
+                        parsed = json.loads(raw_text)
+                        logger.info("[SPATIAL_PLANNER] Gemini (%s) returned valid payload", model)
+                        return parsed
                     else:
-                        logger.warning("[ERROR] Gemini Vision returned 200 but no candidate parts: %s", data)
+                        logger.warning("[SPATIAL_PLANNER] Gemini (%s) 200 OK but no content: %s", model, data)
                 else:
-                    logger.error("[ERROR] Gemini Vision (%s) failed with HTTP %d:\n%s", model, resp.status_code, resp.text)
+                    logger.error("[SPATIAL_PLANNER] Gemini (%s) HTTP %d: %s", model, resp.status_code, resp.text[:300])
+            except json.JSONDecodeError as jde:
+                logger.error("[SPATIAL_PLANNER] JSON parse error from Gemini (%s): %s", model, jde, exc_info=True)
             except Exception as exc:
-                logger.error("[ERROR] Exception connecting to Gemini Vision (%s): %s", model, exc)
+                logger.error("[SPATIAL_PLANNER] Exception calling Gemini (%s): %s", model, exc, exc_info=True)
 
-    logger.error("[ERROR] All candidate Gemini Vision model endpoints failed.")
+    logger.error("[SPATIAL_PLANNER] All Gemini model endpoints failed.")
     return None
-
-
-def _call_openai_vision(
-    image_paths: list[Path],
-    prompt: str,
-    api_key: str,
-) -> Optional[dict]:
-    """Calls OpenAI GPT-4o / GPT-4o-mini REST endpoint with multimodal images."""
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    content_list: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for path in image_paths:
-        b64_data, mime = _encode_image_b64(path)
-        content_list.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{b64_data}"},
-        })
-
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": content_list}],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.1,
-    }
-
-    logger.info("[SPATIAL_PLANNER] Calling OpenAI Vision API with %d photo(s)...", len(image_paths))
-
-    try:
-        with httpx.Client(timeout=35.0) as client:
-            resp = client.post(url, headers=headers, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                raw_text = data["choices"][0]["message"]["content"]
-                parsed_json = json.loads(raw_text)
-                logger.info("[SUCCESS] OpenAI Vision spatial layout returned clean coordinates.")
-                logger.info("[SPATIAL_PLANNER] Parsed payload:\n%s", json.dumps(parsed_json, indent=2))
-                return parsed_json
-            else:
-                logger.error("[ERROR] OpenAI Vision API failed with HTTP %d:\n%s", resp.status_code, resp.text)
-                return None
-    except Exception as exc:
-        logger.error("[ERROR] Exception connecting to OpenAI Vision: %s", exc)
-        return None
-
-
-# ─── Fallback Spatial Layout Reasoning (Door-Anchored) ───────────────────────
-
-def _compute_fallback_plan(
-    room_width_m: float,
-    room_length_m: float,
-    room_height_m: float,
-    detected_items: list[Any] | None,
-) -> SpatialLayoutPlan:
-    """
-    Intelligent door-anchored fallback:
-    1. Sets the entrance door as the primary anchor.
-    2. Positions furniture relative to the door's line-of-sight vector.
-    3. Guarantees coordinates are strictly bounded on floor plane Y=0.0.
-    """
-    logger.info("[FALLBACK] Running door-anchored geometric spatial layout fallback...")
-    w_half = room_width_m / 2.0
-    l_half = room_length_m / 2.0
-
-    door_pred: Optional[DoorPrediction] = None
-    furniture_preds: list[FurniturePrediction] = []
-
-    if not detected_items:
-        return SpatialLayoutPlan(
-            door=DoorPrediction(wall="front", offset_m=0.0, width_m=0.9, height_m=2.1),
-            furniture=[],
-        )
-
-    door_candidates = [it for it in detected_items if getattr(it, "label", "").lower() in ["door", "doorway", "entrance"]]
-    furniture_candidates = [it for it in detected_items if getattr(it, "label", "").lower() not in ["door", "doorway", "entrance"]]
-
-    # Step 1: Anchor Entrance Door
-    if door_candidates:
-        best_door = max(door_candidates, key=lambda x: getattr(x, "confidence", 0.5))
-        bbox = getattr(best_door, "bbox", [0.4, 0.1, 0.6, 0.9])
-        cx = (bbox[0] + bbox[2]) / 2.0
-        offset_m = round((cx - 0.5) * room_width_m * 0.7, 2)
-        door_pred = DoorPrediction(
-            wall="back",
-            offset_m=max(-w_half + 0.6, min(w_half - 0.6, offset_m)),
-            width_m=0.9,
-            height_m=2.1,
-        )
-    else:
-        door_pred = DoorPrediction(
-            wall="front",
-            offset_m=0.0,
-            width_m=0.9,
-            height_m=2.1,
-        )
-
-    # Step 2: Position Furniture Relative to Door Anchor
-    for idx, it in enumerate(furniture_candidates):
-        item_id = getattr(it, "item_id", f"item_{idx+1}")
-        label = getattr(it, "label", "furniture").lower()
-        bbox = getattr(it, "bbox", [0.25, 0.25, 0.75, 0.75])
-
-        # Bounding box center (-0.5 to 0.5 normalized)
-        norm_cx = ((bbox[0] + bbox[2]) / 2.0) - 0.5
-        norm_cz = ((bbox[1] + bbox[3]) / 2.0) - 0.5
-
-        # Metric floor coordinates
-        x = round(float(norm_cx * room_width_m * 0.70), 2)
-        z = round(float(norm_cz * room_length_m * 0.70), 2)
-
-        # Determine wall alignment & rotation relative to doorway
-        wall_alignment = "center"
-        rot_deg = 0.0
-
-        if norm_cx < -0.15:
-            wall_alignment = "left"
-            rot_deg = 90.0
-            x = float(max(-w_half + 0.45, min(w_half - 0.45, x)))
-        elif norm_cx > 0.15:
-            wall_alignment = "right"
-            rot_deg = 270.0
-            x = float(max(-w_half + 0.45, min(w_half - 0.45, x)))
-        elif norm_cz < 0.0:
-            wall_alignment = "back"
-            rot_deg = 0.0
-            z = float(max(-l_half + 0.45, min(l_half - 0.45, z)))
-        else:
-            wall_alignment = "front"
-            rot_deg = 180.0
-            z = float(max(-l_half + 0.45, min(l_half - 0.45, z)))
-
-        furniture_preds.append(
-            FurniturePrediction(
-                id=item_id,
-                label=label,
-                matched_photo_index=0,
-                position=[x, 0.0, z],
-                rotation_y_deg=rot_deg,
-                wall_alignment=wall_alignment,
-            )
-        )
-
-    return SpatialLayoutPlan(door=door_pred, furniture=furniture_preds)
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def plan_spatial_layout(
+def detect_room_contents(
     image_paths: list[Path],
-    room_width_m: float,
-    room_length_m: float,
-    room_height_m: float,
-    detected_items: list[Any] | None = None,
-) -> SpatialLayoutPlan:
+) -> RoomDetectionResult:
     """
-    Main entry point for Door-First Vision LLM Spatial Reasoning.
+    Main entry point: send room photo(s) to Gemini Vision and return
+    detected items with materials/colors/placement + wall/floor colors.
 
-    1. Builds a grounded prompt that includes the exact detected item IDs / labels
-       so Gemini returns strict 1:1 ID-to-coordinate assignments.
-    2. Sends multi-photo prompt to Vision LLM (Gemini cascade → OpenAI fallback).
-    3. Validates & enforces coordinate clamping within room bounds (0.3m margin).
-    4. Falls back to door-anchored geometric floor projection if LLM unavailable.
+    Falls back to an empty result if Vision API is unavailable.
     """
     settings = get_settings()
     gemini_key = settings.gemini_api_key or os.environ.get("GEMINI_API_KEY", "").strip()
-    openai_key = settings.openai_api_key or os.environ.get("OPENAI_API_KEY", "").strip()
 
-    w_half = room_width_m / 2.0
-    l_half = room_length_m / 2.0
+    if not gemini_key:
+        logger.warning("[SPATIAL_PLANNER] No GEMINI_API_KEY found. Returning empty detection result.")
+        return RoomDetectionResult()
 
-    # Build item-aware prompt with explicit IDs
-    prompt = _build_prompt(
-        num_photos=max(1, len(image_paths)),
-        room_width_m=room_width_m,
-        room_length_m=room_length_m,
-        room_height_m=room_height_m,
-        detected_items=detected_items,
-    )
+    raw = _call_gemini_vision(image_paths, gemini_key)
 
-    if detected_items:
-        non_door = [i for i in detected_items if getattr(i, "label", "").lower() not in ["door", "doorway", "entrance"]]
-        logger.info(
-            "[SPATIAL_PLANNER] Planning layout for %d detected items: %s",
-            len(non_door),
-            [(getattr(i, 'item_id', '?'), getattr(i, 'label', '?')) for i in non_door],
-        )
+    if not raw:
+        logger.error("[SPATIAL_PLANNER] Vision API returned no data. Returning empty detection result.")
+        return RoomDetectionResult()
 
-    raw_json: Optional[dict] = None
+    try:
+        hex_re = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
-    if gemini_key:
-        raw_json = _call_gemini_vision(image_paths, prompt, gemini_key)
-    elif openai_key:
-        raw_json = _call_openai_vision(image_paths, prompt, openai_key)
-    else:
-        logger.info("[SPATIAL_PLANNER] No Vision LLM API key detected in .env; utilizing door-anchored floor projection.")
+        def _clean_hex(val: Optional[str]) -> Optional[str]:
+            if val and isinstance(val, str) and hex_re.match(val.strip()):
+                return val.strip().upper()
+            return None
 
-    if raw_json:
-        try:
-            plan = SpatialLayoutPlan.model_validate(raw_json)
+        room_type = str(raw.get("room_type", "bedroom")).lower().strip()
+        wall_color = _clean_hex(raw.get("wall_color_hex")) or "#E8E3DC"
+        floor_color = _clean_hex(raw.get("floor_color_hex")) or "#C8BFB0"
+        floor_material = str(raw.get("floor_material", "hardwood")).lower().strip()
+        hero_item_id = str(raw.get("hero_item_id", "")).strip() or None
 
-            # Strictly enforce coordinate bounds (0.3m margin from each wall)
-            margin = 0.3
-            if plan.door:
-                if plan.door.wall in ["front", "back"]:
-                    plan.door.offset_m = float(max(-w_half + 0.5, min(w_half - 0.5, plan.door.offset_m)))
+        raw_furniture = raw.get("furniture") or raw.get("items") or []
+        detected: list[SemanticFurnitureItem] = []
+
+        for idx, ri in enumerate(raw_furniture):
+            if not isinstance(ri, dict):
+                continue
+            label = str(ri.get("label", "")).lower().strip()
+            if not label:
+                continue
+
+            item_id = str(ri.get("id") or f"item_{idx+1}").strip()
+
+            placement = str(ri.get("placement_type") or ri.get("placement", "floor")).lower().strip()
+            if placement not in ("floor", "wall"):
+                if any(k in label for k in ("wall", "art", "painting", "clock", "mirror")) and "floor" not in label and "table" not in label:
+                    placement = "wall"
                 else:
-                    plan.door.offset_m = float(max(-l_half + 0.5, min(l_half - 0.5, plan.door.offset_m)))
+                    placement = "floor"
 
-            for item in plan.furniture:
-                pos_x = float(item.position[0])
-                pos_z = float(item.position[2] if len(item.position) > 2 else item.position[1])
-                clamped_x = float(max(-w_half + margin, min(w_half - margin, pos_x)))
-                clamped_z = float(max(-l_half + margin, min(l_half - margin, pos_z)))
-                item.position = [clamped_x, 0.0, clamped_z]
-                item.rotation_y_deg = float(item.rotation_y_deg) % 360.0
+            material_raw = str(ri.get("material", "") or "").lower().strip()
+            material = material_raw if material_raw in ("wood", "fabric", "leather", "metal", "glass", "greenery") else None
 
-                # Log each item's resolved placement for debugging
-                logger.info(
-                    "[SPATIAL_PLANNER] Placed '%s' (id=%s) → [%.2f, 0.0, %.2f] rot=%.1f° wall=%s",
-                    item.label, item.id, clamped_x, clamped_z,
-                    item.rotation_y_deg, item.wall_alignment or 'center',
-                )
+            color_hex = _clean_hex(ri.get("dominant_color_hex") or ri.get("color_hex"))
 
-            logger.info(
-                "[SUCCESS] Vision LLM Door-Anchored Spatial Plan validated: %d furniture items placed, door on %s wall (offset %.2fm)",
-                len(plan.furniture),
-                plan.door.wall if plan.door else "none",
-                plan.door.offset_m if plan.door else 0.0,
-            )
-            return plan
-        except Exception as parse_err:
-            logger.error("[ERROR] Failed to validate Vision LLM output against schema: %s", parse_err)
+            sub_variant = ri.get("sub_variant")
+            sub_variant = str(sub_variant).strip() if sub_variant else None
 
-    return _compute_fallback_plan(
-        room_width_m=room_width_m,
-        room_length_m=room_length_m,
-        room_height_m=room_height_m,
-        detected_items=detected_items,
-    )
+            wall_anchor_raw = str(ri.get("wall_anchor") or ri.get("wall_attachment") or "back").lower().strip()
+            if wall_anchor_raw in ("back", "left", "right", "front", "center"):
+                wall_anchor = wall_anchor_raw
+            else:
+                wall_anchor = "back"
+
+            rel_pos_raw = str(ri.get("relative_position", "center")).strip()
+            relative_position = rel_pos_raw if rel_pos_raw else "center"
+
+            height_raw = ri.get("height_m")
+            try:
+                height_m = float(height_raw) if height_raw is not None else (1.5 if placement == "wall" else None)
+            except (ValueError, TypeError):
+                height_m = 1.5 if placement == "wall" else None
+
+            detected.append(SemanticFurnitureItem(
+                id=item_id,
+                label=label,
+                sub_variant=sub_variant,
+                dominant_color_hex=color_hex,
+                material=material,
+                wall_anchor=wall_anchor,
+                relative_position=relative_position,
+                placement_type=placement,
+                height_m=height_m,
+            ))
+
+        # If hero_item_id wasn't set or not in detected items, pick the primary floor item
+        if not hero_item_id and detected:
+            floor_items = [it for it in detected if it.placement_type == "floor"]
+            # Look for bed or sofa or desk
+            hero_candidates = [it for it in floor_items if any(k in it.label for k in ("bed", "sofa", "desk"))]
+            if hero_candidates:
+                hero_item_id = hero_candidates[0].id
+            elif floor_items:
+                hero_item_id = floor_items[0].id
+
+        result = RoomDetectionResult(
+            room_type=room_type,
+            wall_color_hex=wall_color,
+            floor_color_hex=floor_color,
+            floor_material=floor_material,
+            hero_item_id=hero_item_id,
+            furniture=detected,
+        )
+        logger.info(
+            "[SPATIAL_PLANNER] Detection complete: %s room | hero=%s | %d item(s) | wall=%s floor=%s",
+            room_type, hero_item_id, len(detected), wall_color, floor_color
+        )
+        for it in detected:
+            logger.info("  → [%s] ID='%s' label='%s' (sub=%s) | mat=%s color=%s anchor=%s rel=%s h=%s",
+                        it.placement_type, it.id, it.label, it.sub_variant, it.material,
+                        it.dominant_color_hex, it.wall_anchor, it.relative_position, it.height_m)
+        return result
+
+    except Exception as exc:
+        logger.error("[SPATIAL_PLANNER] Failed to parse detection result: %s", exc, exc_info=True)
+        return RoomDetectionResult()
+
+
+def plan_spatial_layout(*args, **kwargs) -> RoomDetectionResult:
+    """Backwards-compatibility alias for detect_room_contents."""
+    image_paths = kwargs.get("image_paths", args[0] if args else [])
+    return detect_room_contents(image_paths)

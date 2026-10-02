@@ -3,11 +3,6 @@ import {
   X, 
   RotateCw, 
   Trash2, 
-  Sparkles, 
-  Box, 
-  Palette, 
-  Maximize2, 
-  Layers,
   Check
 } from 'lucide-react';
 import { useRoomStore } from '../../store/roomStore';
@@ -22,10 +17,7 @@ export function FurnitureInspector() {
     setSelectedId, 
     manifest, 
     updateFurnitureItem, 
-    updateFurnitureTemplate,
-    updateFurnitureMaterial,
-    updateFurnitureDimensions,
-    setMeshSource,
+    removeFurnitureItem,
     dimensions: roomDims,
   } = useRoomStore();
 
@@ -38,7 +30,6 @@ export function FurnitureInspector() {
 
   const categoryTemplates = getTemplatesForCategory(selectedItem.label);
   const activeTemplateId = selectedItem.templateId || categoryTemplates[0]?.id;
-  const isTemplateMode = selectedItem.meshSource !== 'reconstruction';
   const activePreset = selectedItem.materialPreset || 'Oak Wood';
   const activeColor = selectedItem.colorTint || selectedItem.dominantColor || '#C49E6C';
 
@@ -76,13 +67,7 @@ export function FurnitureInspector() {
   };
 
   const handleDelete = () => {
-    if (manifest) {
-      useRoomStore.getState().setManifest({
-        ...manifest,
-        furniture: manifest.furniture.filter((f) => f.id !== selectedItem.id),
-      });
-      setSelectedId(null);
-    }
+    removeFurnitureItem(selectedItem.id);
   };
 
   return (
@@ -98,44 +83,17 @@ export function FurnitureInspector() {
           className="inspector-close-btn"
           title="Close Inspector (Esc)"
         >
-          <X size={16} />
+          <X size={15} />
         </button>
       </div>
 
       <div className="inspector-content">
-        {/* ── 1. Mesh Source Toggle ──────────────────────────── */}
-        <section className="inspector-section">
-          <label className="inspector-label">
-            <Layers size={13} className="text-indigo-400" />
-            <span>3D Mesh Engine</span>
-          </label>
-          <div className="mesh-source-toggle">
-            <button
-              type="button"
-              className={`source-btn ${isTemplateMode ? 'active' : ''}`}
-              onClick={() => setMeshSource(selectedItem.id, 'template')}
-            >
-              <Sparkles size={14} />
-              <span>Curated Template</span>
-            </button>
-            <button
-              type="button"
-              className={`source-btn ${!isTemplateMode ? 'active' : ''}`}
-              onClick={() => setMeshSource(selectedItem.id, 'reconstruction')}
-            >
-              <Box size={14} />
-              <span>AI Mesh</span>
-            </button>
-          </div>
-        </section>
-
-        {/* ── 2. Style Switcher (Template Catalog) ───────────── */}
-        {isTemplateMode && categoryTemplates.length > 0 && (
+        {/* ── 1. Template & Style ────────────────────────────── */}
+        {categoryTemplates.length > 0 && (
           <section className="inspector-section">
-            <label className="inspector-label">
-              <Box size={13} className="text-indigo-400" />
-              <span>Catalog Style ({categoryTemplates.length})</span>
-            </label>
+            <h4 className="text-[11px] font-medium uppercase tracking-wider text-zinc-400 mb-2">
+              Template & Style
+            </h4>
             <div className="template-grid">
               {categoryTemplates.map((tpl) => {
                 const isSelected = activeTemplateId === tpl.id;
@@ -145,12 +103,13 @@ export function FurnitureInspector() {
                     type="button"
                     className={`template-card ${isSelected ? 'selected' : ''}`}
                     onClick={() => {
-                      updateFurnitureTemplate(selectedItem.id, tpl.id);
-                      // Update default dimensions if current dims are far off
-                      updateFurnitureDimensions(selectedItem.id, tpl.defaultDimensions);
+                      updateFurnitureItem(selectedItem.id, {
+                        templateId: tpl.id,
+                        dimensions: tpl.defaultDimensions,
+                        meshSource: 'template',
+                      });
                     }}
                   >
-                    <span className="template-icon">{tpl.thumbnail}</span>
                     <div className="template-info">
                       <span className="template-name">{tpl.name}</span>
                       <span className="template-desc">{tpl.description}</span>
@@ -167,21 +126,20 @@ export function FurnitureInspector() {
           </section>
         )}
 
-        {/* ── 3. Material & Color Customization ──────────────── */}
+        {/* ── 2. Material & Finish ───────────────────────────── */}
         <section className="inspector-section">
-          <label className="inspector-label">
-            <Palette size={13} className="text-indigo-400" />
-            <span>Material & Color Finish</span>
-          </label>
+          <h4 className="text-[11px] font-medium uppercase tracking-wider text-zinc-400 mb-2">
+            Material & Finish
+          </h4>
 
-          {/* Auto-Sampled Photo Color Badge */}
+          {/* Sampled Color Badge */}
           {selectedItem.dominantColor && (
             <div className="photo-color-badge">
-              <span className="badge-sub">Auto-Sampled from Photo:</span>
+              <span className="badge-sub">Sampled Color:</span>
               <button
                 type="button"
                 className="color-pill-btn"
-                onClick={() => updateFurnitureMaterial(selectedItem.id, { colorTint: selectedItem.dominantColor })}
+                onClick={() => updateFurnitureItem(selectedItem.id, { colorTint: selectedItem.dominantColor })}
               >
                 <span 
                   className="color-swatch-circle" 
@@ -193,7 +151,7 @@ export function FurnitureInspector() {
           )}
 
           {/* Material Presets Swatches */}
-          <div className="presets-label">PBR Material Presets:</div>
+          <div className="presets-label">Material Presets:</div>
           <div className="preset-swatches-grid">
             {Object.entries(MATERIAL_PRESETS).map(([name, p]) => {
               const isSelected = activePreset === name;
@@ -204,7 +162,7 @@ export function FurnitureInspector() {
                   className={`preset-swatch-btn ${isSelected ? 'active' : ''}`}
                   title={`${name} (${p.category})`}
                   onClick={() => {
-                    updateFurnitureMaterial(selectedItem.id, {
+                    updateFurnitureItem(selectedItem.id, {
                       materialPreset: name,
                       colorTint: p.color,
                     });
@@ -222,18 +180,18 @@ export function FurnitureInspector() {
 
           {/* Custom Hex Color Picker */}
           <div className="custom-color-row">
-            <span className="text-xs text-slate-400">Custom Tint:</span>
+            <span className="text-xs text-zinc-400">Custom Tint:</span>
             <div className="color-picker-wrap">
               <input
                 type="color"
                 value={activeColor.startsWith('#') ? activeColor : '#C49E6C'}
-                onChange={(e) => updateFurnitureMaterial(selectedItem.id, { colorTint: e.target.value })}
+                onChange={(e) => updateFurnitureItem(selectedItem.id, { colorTint: e.target.value })}
                 className="native-color-picker"
               />
               <input
                 type="text"
                 value={activeColor}
-                onChange={(e) => updateFurnitureMaterial(selectedItem.id, { colorTint: e.target.value })}
+                onChange={(e) => updateFurnitureItem(selectedItem.id, { colorTint: e.target.value })}
                 className="hex-text-input"
                 maxLength={7}
               />
@@ -241,12 +199,11 @@ export function FurnitureInspector() {
           </div>
         </section>
 
-        {/* ── 4. Metric Dimensions Scale ─────────────────────── */}
+        {/* ── 3. Dimensions (m) ──────────────────────────────── */}
         <section className="inspector-section">
-          <label className="inspector-label">
-            <Maximize2 size={13} className="text-indigo-400" />
-            <span>Metric Dimensions (W × H × D)</span>
-          </label>
+          <h4 className="text-[11px] font-medium uppercase tracking-wider text-zinc-400 mb-2">
+            Dimensions (m)
+          </h4>
 
           <div className="dim-sliders-wrap">
             {/* Width */}
@@ -263,7 +220,7 @@ export function FurnitureInspector() {
                 value={w}
                 onChange={(e) => {
                   const val = parseFloat(e.target.value);
-                  updateFurnitureDimensions(selectedItem.id, [val, h, d]);
+                  updateFurnitureItem(selectedItem.id, { dimensions: [val, h, d] });
                 }}
                 className="inspector-range"
               />
@@ -283,7 +240,7 @@ export function FurnitureInspector() {
                 value={h}
                 onChange={(e) => {
                   const val = parseFloat(e.target.value);
-                  updateFurnitureDimensions(selectedItem.id, [w, val, d]);
+                  updateFurnitureItem(selectedItem.id, { dimensions: [w, val, d] });
                 }}
                 className="inspector-range"
               />
@@ -303,7 +260,7 @@ export function FurnitureInspector() {
                 value={d}
                 onChange={(e) => {
                   const val = parseFloat(e.target.value);
-                  updateFurnitureDimensions(selectedItem.id, [w, h, val]);
+                  updateFurnitureItem(selectedItem.id, { dimensions: [w, h, val] });
                 }}
                 className="inspector-range"
               />
@@ -311,12 +268,11 @@ export function FurnitureInspector() {
           </div>
         </section>
 
-        {/* ── 5. Quick Transforms & Alignments ───────────────── */}
+        {/* ── 4. Actions & Alignments ────────────────────────── */}
         <section className="inspector-section">
-          <label className="inspector-label">
-            <RotateCw size={13} className="text-indigo-400" />
-            <span>Transform & Wall Alignment</span>
-          </label>
+          <h4 className="text-[11px] font-medium uppercase tracking-wider text-zinc-400 mb-2">
+            Actions
+          </h4>
 
           <div className="quick-actions-row">
             <button
@@ -371,7 +327,7 @@ export function FurnitureInspector() {
           </div>
         </section>
 
-        {/* ── 6. Delete Action ───────────────────────────────── */}
+        {/* ── Delete Action ───────────────────────────────── */}
         <div className="inspector-delete-wrap">
           <button
             type="button"
@@ -379,7 +335,7 @@ export function FurnitureInspector() {
             onClick={handleDelete}
           >
             <Trash2 size={14} />
-            <span>Remove Object from Room</span>
+            <span>Remove Object</span>
           </button>
         </div>
       </div>

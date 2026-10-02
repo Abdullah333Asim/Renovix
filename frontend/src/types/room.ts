@@ -2,18 +2,26 @@
 
 export type MeasurementUnit = 'metric' | 'imperial';
 
+export type RoomShapeType = 'rectangle' | 'custom_polygon';
+
 export interface DoorConfig {
   wall: 'front' | 'back' | 'left' | 'right';
   position: number; // Center position / metric offset along the selected wall
   widthM: number;
   heightM: number;
+  swing?: 'inward' | 'outward';
+  segmentIndex?: number;
 }
 
 export interface RoomDimensions {
-  widthM: number;
-  lengthM: number;
-  heightM: number;
+  widthM: number;       // Bounding-box width
+  lengthM: number;      // Bounding-box length
+  heightM: number;      // Wall height
+  shapeType?: RoomShapeType;
+  polygonVertices?: [number, number][]; // 2-D floor points in metres, centroid at [0,0]
   door?: DoorConfig;
+  wallColor?: string;   // Dominant wall paint color hex (auto-sampled from photos)
+  floorColor?: string;  // Dominant floor surface color hex (auto-sampled from photos)
 }
 
 export interface FurnitureItem {
@@ -29,6 +37,7 @@ export interface FurnitureItem {
   colorTint?: string;
   materialPreset?: string;
   meshSource?: 'template' | 'reconstruction';
+  placement?: 'floor' | 'wall';
 }
 
 export interface DetectionReviewItem {

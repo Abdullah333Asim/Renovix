@@ -1,9 +1,12 @@
 import { useMemo, useRef, useState, useEffect, Suspense } from 'react';
 import { useGLTF, Html } from '@react-three/drei';
+import type { ThreeEvent } from '@react-three/fiber';
 import * as THREE from 'three';
 import type { FurnitureItem as FurnitureItemType } from '../../types/room';
 import { useRoomStore } from '../../store/roomStore';
 import { ProceduralFurnitureMesh } from './ProceduralFurnitureMesh';
+import { isPointInPolygon, clampToPolygon } from '../../utils/geometry';
+
 
 interface FurnitureItemProps {
   item: FurnitureItemType;
@@ -107,12 +110,24 @@ export function FurnitureItem({ item }: FurnitureItemProps) {
     const box = new THREE.Box3().setFromObject(groupRef.current);
 
     let collision = false;
-    const { widthM, lengthM } = dimensions;
-    if (
-      box.min.x < -widthM / 2 || box.max.x > widthM / 2 ||
-      box.min.z < -lengthM / 2 || box.max.z > lengthM / 2
-    ) {
-      collision = true;
+    const { widthM, lengthM, shapeType, polygonVertices } = dimensions;
+
+    if (shapeType === 'custom_polygon' && polygonVertices && polygonVertices.length >= 3) {
+      // PIP check: test the four floor corners of this item's bounding box
+      const corners: [number, number][] = [
+        [box.min.x, box.min.z],
+        [box.max.x, box.min.z],
+        [box.max.x, box.max.z],
+        [box.min.x, box.max.z],
+      ];
+      collision = corners.some(c => !isPointInPolygon(c, polygonVertices));
+    } else {
+      if (
+        box.min.x < -widthM / 2 || box.max.x > widthM / 2 ||
+        box.min.z < -lengthM / 2 || box.max.z > lengthM / 2
+      ) {
+        collision = true;
+      }
     }
 
     if (!collision) {
@@ -142,7 +157,7 @@ export function FurnitureItem({ item }: FurnitureItemProps) {
 
   // ── Pointer Handlers ──────────────────────────────────────────────────────
 
-  const handlePointerDown = (e: any) => {
+  const handlePointerDown = (e: ThreeEvent<PointerEvent>) => {
     // Always stop propagation so Canvas onPointerMissed never fires on objects
     e.stopPropagation();
 
@@ -161,12 +176,13 @@ export function FurnitureItem({ item }: FurnitureItemProps) {
     }
 
     // Capture pointer so mousemove events continue even if cursor leaves mesh
-    if (e.target?.setPointerCapture) {
-      e.target.setPointerCapture(e.pointerId);
+    const target = e.target as unknown as HTMLElement;
+    if (target?.setPointerCapture && e.pointerId !== undefined) {
+      target.setPointerCapture(e.pointerId);
     }
   };
 
-  const handlePointerUp = (e: any) => {
+  const handlePointerUp = (e: ThreeEvent<PointerEvent>) => {
     if (!isDraggingRef.current) return;
 
     // Commit final position to store
@@ -181,8 +197,9 @@ export function FurnitureItem({ item }: FurnitureItemProps) {
     }
 
     // Release pointer capture
-    if (e.target?.releasePointerCapture) {
-      e.target.releasePointerCapture(e.pointerId);
+    const target = e.target as unknown as HTMLElement;
+    if (target?.releasePointerCapture && e.pointerId !== undefined) {
+      target.releasePointerCapture(e.pointerId);
     }
 
     isDraggingRef.current = false;
@@ -193,7 +210,7 @@ export function FurnitureItem({ item }: FurnitureItemProps) {
     e.stopPropagation();
   };
 
-  const handlePointerMove = (e: any) => {
+  const handlePointerMove = (e: ThreeEvent<PointerEvent>) => {
     if (!isDraggingRef.current || !groupRef.current) return;
     e.stopPropagation();
 
@@ -202,13 +219,31 @@ export function FurnitureItem({ item }: FurnitureItemProps) {
     e.ray.intersectPlane(plane, intersect);
 
     if (intersect) {
-      groupRef.current.position.x = intersect.x + dragOffset.current.x;
-      groupRef.current.position.z = intersect.z + dragOffset.current.z;
+      let nx = intersect.x + dragOffset.current.x;
+      let nz = intersect.z + dragOffset.current.z;
+
+      // Clamp to polygon when a custom shape is active
+      const { shapeType, polygonVertices, widthM, lengthM } = dimensions;
+      if (shapeType === 'custom_polygon' && polygonVertices && polygonVertices.length >= 3) {
+        const [cx, cz] = clampToPolygon([nx, nz], polygonVertices);
+        nx = cx;
+        nz = cz;
+      } else {
+        // Standard rectangular bounds clamp
+        const hx = widthM / 2 - 0.1;
+        const hz = lengthM / 2 - 0.1;
+        nx = Math.max(-hx, Math.min(hx, nx));
+        nz = Math.max(-hz, Math.min(hz, nz));
+      }
+
+      groupRef.current.position.x = nx;
+      groupRef.current.position.z = nz;
       checkCollisions();
     }
   };
 
-  const handleClick = (e: any) => {
+
+  const handleClick = (e: ThreeEvent<MouseEvent>) => {
     // Always stop propagation — prevents Canvas onPointerMissed from deselecting
     e.stopPropagation();
     // Selection is already set on pointerDown; nothing extra needed here
@@ -234,6 +269,7 @@ export function FurnitureItem({ item }: FurnitureItemProps) {
           dimensions={item.dimensions}
           colorTint={item.colorTint || item.dominantColor}
           materialPreset={item.materialPreset}
+          materialType={item.materialType}
         />
       ) : (
         <Suspense
@@ -244,6 +280,7 @@ export function FurnitureItem({ item }: FurnitureItemProps) {
               dimensions={item.dimensions}
               colorTint={item.colorTint || item.dominantColor}
               materialPreset={item.materialPreset}
+              materialType={item.materialType}
             />
           }
         >

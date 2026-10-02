@@ -3,17 +3,69 @@
 
 <head>
   <meta charset="UTF-8" />
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Renovix — AI 3D Room Renovator</title>
-  <meta name="description" content="Renovix — AI-Powered 3D Room Digital Twin & Spatial Interior Staging Engine" />
-  <meta property="og:title" content="Renovix — AI 3D Room Renovator" />
-  <meta property="og:description" content="AI-Powered 3D Room Digital Twin & Spatial Interior Staging Engine" />
+
+  <!-- ── Favicon ──────────────────────────────────────────────────────── -->
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+
+  <!-- ── Primary SEO ──────────────────────────────────────────────────── -->
+  <title>Renovix — 3D Room Planner &amp; Interior Spatial Studio</title>
+  <meta name="description" content="Transform room photos into interactive 3D digital twins. Arrange furniture, customize PBR materials, draw custom floorplans, and stage interiors directly in your browser." />
+  <meta name="keywords" content="3D room planner, interior design tool, digital twin, custom floorplan drawer, 3D furniture staging, spatial editor, Three.js interior studio" />
+  <meta name="author" content="Renovix" />
+  <meta name="robots" content="index, follow" />
+  <link rel="canonical" href="https://renovix.app/" />
+
+  <!-- ── Open Graph (LinkedIn / Discord / WhatsApp / Facebook) ────────── -->
   <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://renovix.app/" />
+  <meta property="og:site_name" content="Renovix" />
+  <meta property="og:title" content="Renovix — 3D Room Planner &amp; Interior Spatial Studio" />
+  <meta property="og:description" content="Generate interactive 3D digital twins from photos. Plan custom floorplans, customize furniture templates, and stage spaces in real time." />
+  <meta property="og:image" content="https://renovix.app/og-preview.png" />
+
+  <!-- ── Twitter / X Card ─────────────────────────────────────────────── -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:url" content="https://renovix.app/" />
+  <meta name="twitter:title" content="Renovix — 3D Room Planner &amp; Interior Spatial Studio" />
+  <meta name="twitter:description" content="Generate interactive 3D digital twins from photos. Plan custom floorplans, customize furniture templates, and stage spaces in real time." />
+  <meta name="twitter:image" content="https://renovix.app/og-preview.png" />
+
+  <!-- ── Structured Data: Schema.org WebApplication ───────────────────── -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Renovix",
+    "url": "https://renovix.app",
+    "applicationCategory": "DesignApplication",
+    "operatingSystem": "All",
+    "browserRequirements": "Requires WebGL support",
+    "description": "Interactive 3D room renovation and spatial interior design studio for designing custom floorplans and staging digital twin spaces.",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "featureList": [
+      "Photo-to-3D room reconstruction",
+      "Custom 2D floorplan drawing & polygonal extrusion",
+      "Interactive PBR furniture catalog & material customizer",
+      "Real-time raycast 3D spatial dragging and rotation"
+    ]
+  }
+  </script>
 </head>
 
 <body>
   <div id="root"></div>
+
+  <!-- Noscript fallback for crawlers without JS/WebGL execution -->
+  <noscript>
+    <h1>Renovix — 3D Room Planner &amp; Interior Spatial Studio</h1>
+    <p>Renovix is an in-browser 3D interior design and spatial staging platform. Turn room photos into interactive digital twins, create custom floorplans, and arrange furniture in 3D.</p>
+  </noscript>
+
   <script type="module" src="/src/main.tsx"></script>
 </body>
 

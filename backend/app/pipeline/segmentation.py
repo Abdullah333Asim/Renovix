@@ -42,26 +42,7 @@ DEFAULT_FURNITURE_CLASSES = [
 ]
 
 # Canonical dictionary for label normalization
-CANONICAL_CLASSES = [
-    "bed",
-    "sofa",
-    "couch",
-    "armchair",
-    "chair",
-    "dining table",
-    "coffee table",
-    "desk",
-    "nightstand",
-    "wardrobe",
-    "closet",
-    "bookshelf",
-    "bookcase",
-    "cabinet",
-    "dresser",
-    "door",
-    "doorway",
-    "entrance",
-]
+CANONICAL_CLASSES = DEFAULT_FURNITURE_CLASSES
 
 
 def canonicalize_label(raw_label: str) -> str:
@@ -546,3 +527,98 @@ class VisionPipeline:
         canvas.paste(crop_rgba, (paste_x, paste_y), crop_rgba)
 
         return canvas
+
+
+# ─── Wall & Floor Color Extraction ───────────────────────────────────────────
+
+def _bgr_to_hex(bgr: np.ndarray) -> str:
+    """Convert a BGR numpy array (1D, 3 elements) to a hex color string."""
+    b, g, r = int(bgr[0]), int(bgr[1]), int(bgr[2])
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _dominant_color_kmeans(pixels: np.ndarray, k: int = 3) -> str:
+    """
+    Run K-Means on a float32 pixel array (N×3, BGR) and return the
+    hex color of the largest cluster centroid.
+    """
+    if len(pixels) < k:
+        # Not enough pixels — return a neutral grey
+        return "#e8e2d9"
+
+    pixels_f = pixels.astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
+    _, labels, centers = cv2.kmeans(
+        pixels_f, k, None, criteria, 5, cv2.KMEANS_RANDOM_CENTERS
+    )
+    # Count pixels per cluster and take the largest
+    counts = np.bincount(labels.flatten(), minlength=k)
+    dominant_idx = int(np.argmax(counts))
+    return _bgr_to_hex(centers[dominant_idx])
+
+
+def extract_wall_and_floor_colors(
+    image_path: Path,
+    object_bboxes: list[tuple[int, int, int, int]] | None = None,
+) -> tuple[str, str]:
+    """
+    Sample dominant wall and floor colors from a room photo using OpenCV K-Means.
+
+    Strategy:
+      - Wall region  : top 35% of the image (above furniture line)
+      - Floor region : bottom 20% of the image (below furniture line)
+      - Furniture bounding boxes are masked out in both regions.
+
+    Args:
+        image_path: Path to the source room image.
+        object_bboxes: Optional list of (x0, y0, x1, y1) pixel bounding boxes
+                       from detected furniture to exclude from sampling.
+
+    Returns:
+        (wall_hex, floor_hex) — dominant color hex strings for wall and floor.
+    """
+    WALL_HEX_FALLBACK = "#e8e2d9"
+    FLOOR_HEX_FALLBACK = "#c8bfb0"
+
+    try:
+        img = cv2.imread(str(image_path))
+        if img is None:
+            logger.warning("[COLOR_EXTRACT] Could not read image at %s", image_path)
+            return WALL_HEX_FALLBACK, FLOOR_HEX_FALLBACK
+
+        h, w = img.shape[:2]
+
+        # ── Build a furniture-exclusion mask ──────────────────────────────
+        exclusion = np.zeros((h, w), dtype=np.uint8)
+        if object_bboxes:
+            for (x0, y0, x1, y1) in object_bboxes:
+                x0c, y0c = max(0, x0), max(0, y0)
+                x1c, y1c = min(w, x1), min(h, y1)
+                exclusion[y0c:y1c, x0c:x1c] = 255
+
+        # ── Wall region: top 35% ──────────────────────────────────────────
+        wall_h = int(h * 0.35)
+        wall_strip = img[:wall_h, :, :]
+        excl_strip_wall = exclusion[:wall_h, :]
+        wall_mask = (excl_strip_wall == 0)
+        wall_pixels = wall_strip[wall_mask]
+
+        # ── Floor region: bottom 20% ──────────────────────────────────────
+        floor_start = int(h * 0.80)
+        floor_strip = img[floor_start:, :, :]
+        excl_strip_floor = exclusion[floor_start:, :]
+        floor_mask = (excl_strip_floor == 0)
+        floor_pixels = floor_strip[floor_mask]
+
+        wall_hex = _dominant_color_kmeans(wall_pixels, k=3) if len(wall_pixels) >= 3 else WALL_HEX_FALLBACK
+        floor_hex = _dominant_color_kmeans(floor_pixels, k=3) if len(floor_pixels) >= 3 else FLOOR_HEX_FALLBACK
+
+        logger.info(
+            "[COLOR_EXTRACT] Extracted room colors -> Wall: %s  Floor: %s  (from %s)",
+            wall_hex, floor_hex, image_path.name,
+        )
+        return wall_hex, floor_hex
+
+    except Exception as exc:
+        logger.warning("[COLOR_EXTRACT] Failed to extract colors from %s: %s", image_path, exc)
+        return WALL_HEX_FALLBACK, FLOOR_HEX_FALLBACK

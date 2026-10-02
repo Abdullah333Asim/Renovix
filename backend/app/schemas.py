@@ -22,10 +22,12 @@ class JobStage(str, Enum):
 # ─── Room & Furniture ─────────────────────────────────────────────────────────
 
 class DoorConfig(BaseModel):
-    wall: str = Field("back", description="Wall location: front, back, left, right")
+    wall: str = Field("front", description="Wall location: front, back, left, right")
     position: float = Field(0.0, description="Metric offset along wall relative to wall center (meters)")
     widthM: float = Field(0.9, alias="width_m", description="Door width in meters")
     heightM: float = Field(2.1, alias="height_m", description="Door height in meters")
+    swing: Optional[str] = Field("inward", description="Door swing direction: 'inward' or 'outward'")
+    segmentIndex: Optional[int] = Field(0, alias="segment_index", description="Perimeter wall segment index for polygon rooms")
 
     model_config = {
         "populate_by_name": True,
@@ -37,7 +39,14 @@ class RoomDimensions(BaseModel):
     width_m: float = Field(..., gt=0, le=50, description="Room width in metres (X-axis)")
     length_m: float = Field(..., gt=0, le=50, description="Room length in metres (Z-axis)")
     height_m: float = Field(..., gt=1, le=20, description="Room height in metres (Y-axis)")
+    shape_type: Optional[str] = Field(None, description="'rectangle' or 'custom_polygon'")
+    polygon_vertices: Optional[list[list[float]]] = Field(
+        None,
+        description="2D floor polygon vertices [[x,z], ...] in metres, centred at [0,0]. Only set when shape_type='custom_polygon'."
+    )
     door: Optional[DoorConfig] = None
+    wall_color: Optional[str] = Field("#e8e2d9", description="Dominant wall paint color hex sampled from photos")
+    floor_color: Optional[str] = Field("#c8bfb0", description="Dominant floor surface color hex sampled from photos")
 
 
 class FurnitureItem(BaseModel):
@@ -58,6 +67,7 @@ class FurnitureItem(BaseModel):
     template_id: Optional[str] = Field(None, description="Curated 3D template identifier")
     color_tint: Optional[str] = Field(None, description="Active PBR color tint hex")
     material_preset: Optional[str] = Field(None, description="Active material preset name")
+    placement: str = Field("floor", description="'floor' for floor items, 'wall' for wall-mounted items")
     mesh_source: str = Field("template", description="Active mesh source: 'template' | 'reconstruction'")
 
 
@@ -71,7 +81,7 @@ class SceneManifest(BaseModel):
     room_dimensions: RoomDimensions
     textures: SceneTextures = SceneTextures()
     furniture: list[FurnitureItem] = []
-    door: Optional[DoorConfig] = None
+
 
 
 # ─── Detection Review ─────────────────────────────────────────────────────────

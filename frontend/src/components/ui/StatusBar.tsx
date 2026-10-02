@@ -1,4 +1,4 @@
-import { Loader2, CheckCircle2, AlertCircle, Clock, ScanSearch, Paintbrush, Box, Cpu, Zap, Check } from 'lucide-react';
+import { Loader2, CheckCircle2, AlertCircle, Clock, ScanSearch, Paintbrush, Box, Cpu, Check } from 'lucide-react';
 import { useRoomStore } from '../../store/roomStore';
 import type { JobStage } from '../../types/room';
 
@@ -14,13 +14,13 @@ const STAGE_COLORS: Record<JobStage, string> = {
 };
 
 const STAGES: Record<JobStage, { icon: React.ReactNode; label: string }> = {
-  idle:          { icon: <Zap size={13} />,          label: 'Awaiting upload' },
+  idle:          { icon: <Clock size={13} />,         label: 'Awaiting upload' },
   queued:        { icon: <Clock size={13} />,         label: 'Queued' },
-  segmenting:    { icon: <ScanSearch size={13} />,    label: 'Detecting furniture…' },
-  inpainting:    { icon: <Paintbrush size={13} />,    label: 'Inpainting surfaces…' },
-  generating_3d: { icon: <Box size={13} />,           label: 'Generating 3D meshes…' },
+  segmenting:    { icon: <ScanSearch size={13} />,    label: 'Analyzing geometry…' },
+  inpainting:    { icon: <Paintbrush size={13} />,    label: 'Processing surfaces…' },
+  generating_3d: { icon: <Box size={13} />,           label: 'Generating 3D model…' },
   optimizing:    { icon: <Cpu size={13} />,           label: 'Optimising layout…' },
-  ready:         { icon: <CheckCircle2 size={13} />,  label: 'Scene ready' },
+  ready:         { icon: <CheckCircle2 size={13} />,  label: 'Ready' },
   error:         { icon: <AlertCircle size={13} />,   label: 'Error' },
 };
 
@@ -103,7 +103,7 @@ export function StatusBar() {
               Detected ({detections.length})
             </span>
             <span style={{ fontSize: '10px', color: 'hsl(145, 55%, 55%)', display: 'flex', alignItems: 'center', gap: '3px' }}>
-              <Check size={10} /> NMS cleaned
+              <Check size={10} /> Processed
             </span>
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px', maxHeight: '90px', overflowY: 'auto', paddingRight: '2px' }}>

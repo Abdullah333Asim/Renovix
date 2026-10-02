@@ -86,9 +86,23 @@ function parseDoor(rawDoor: unknown): DoorConfig | undefined {
  */
 function parseManifest(raw: Record<string, unknown>): SceneManifest {
   const dim = (raw.room_dimensions || {}) as Record<string, unknown>;
-  const rawDoor = dim.door || raw.door;
+  const rawDoor = dim.door;
   const door = parseDoor(rawDoor);
   const furnitureRaw = (raw.furniture as Record<string, unknown>[]) ?? [];
+
+  // Extract wall/floor colors — may appear on dim or manifest root
+  const wallColor =
+    (typeof dim.wall_color === 'string' && dim.wall_color) ||
+    (typeof dim.wallColor === 'string' && dim.wallColor) ||
+    (typeof raw.wall_color === 'string' && raw.wall_color) ||
+    (typeof raw.wallColor === 'string' && raw.wallColor) ||
+    '#e8e2d9';
+  const floorColor =
+    (typeof dim.floor_color === 'string' && dim.floor_color) ||
+    (typeof dim.floorColor === 'string' && dim.floorColor) ||
+    (typeof raw.floor_color === 'string' && raw.floor_color) ||
+    (typeof raw.floorColor === 'string' && raw.floorColor) ||
+    '#c8bfb0';
 
   return {
     jobId: (raw.job_id as string) || '',
@@ -96,7 +110,11 @@ function parseManifest(raw: Record<string, unknown>): SceneManifest {
       widthM:  typeof dim.width_m === 'number' ? dim.width_m : (typeof dim.widthM === 'number' ? dim.widthM : 4),
       lengthM: typeof dim.length_m === 'number' ? dim.length_m : (typeof dim.lengthM === 'number' ? dim.lengthM : 5),
       heightM: typeof dim.height_m === 'number' ? dim.height_m : (typeof dim.heightM === 'number' ? dim.heightM : 2.7),
+      shapeType: ((dim.shape_type as any) || (dim.shapeType as any) || 'rectangle'),
+      polygonVertices: ((dim.polygon_vertices as any) || (dim.polygonVertices as any)),
       door:    door,
+      wallColor,
+      floorColor,
     },
     textures: (raw.textures as SceneManifest['textures']) ?? {},
     furniture: furnitureRaw.map((f) => ({
@@ -112,6 +130,7 @@ function parseManifest(raw: Record<string, unknown>): SceneManifest {
       colorTint:      (f.color_tint as string) ?? (f.dominant_color as string) ?? undefined,
       materialPreset: (f.material_preset as string) ?? undefined,
       meshSource:     ((f.mesh_source as string) === 'reconstruction' ? 'reconstruction' : 'template') as 'template' | 'reconstruction',
+      placement:      ((f.placement as string) === 'wall' ? 'wall' : 'floor') as 'floor' | 'wall',
     })),
   };
 }
@@ -173,13 +192,34 @@ export function useSSE(jobId: string | null) {
       try {
         const raw = JSON.parse(e.data) as Record<string, unknown>;
         const manifest = parseManifest(raw);
-        console.log('[SSE] Manifest received:', manifest.furniture.length, 'items', 'door:', manifest.roomDimensions.door);
+        console.log(
+          '[SSE] Manifest received:',
+          manifest.furniture.length,
+          'items | wallColor:',
+          manifest.roomDimensions.wallColor,
+          '| floorColor:',
+          manifest.roomDimensions.floorColor
+        );
+
+        // 1. Dispatch manifest to store
         setManifest(manifest);
-        // Auto-populate dimensions (including door) in store
+
+        // 2. Auto-populate dimensions (including shape & polygon) in store
         useRoomStore.getState().setDimensions(manifest.roomDimensions);
+
+        // 3. Actively dispatch auto-detected wall & floor colors
+        if (manifest.roomDimensions.wallColor) {
+          useRoomStore.getState().setWallColor(manifest.roomDimensions.wallColor);
+        }
+        if (manifest.roomDimensions.floorColor) {
+          useRoomStore.getState().setFloorColor(manifest.roomDimensions.floorColor);
+        }
+
+        // 4. Door if present
         if (manifest.roomDimensions.door) {
           useRoomStore.getState().setDoor(manifest.roomDimensions.door);
         }
+
         setJobStatus({ jobId, stage: 'ready', progress: 100, message: 'Scene ready!' });
         es.close();
       } catch (err) {
